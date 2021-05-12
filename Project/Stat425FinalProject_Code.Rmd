@@ -1,0 +1,407 @@
+---
+title: "Final_Project"
+author: "Alex Funches and Mark Belsis"
+date: "November 18, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Data Introduction, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+weather = read.csv("weather.csv")   # Weather data for each date between 1/1/2012 and 3/31/2013 (20,517 observations, 20 variables)
+train_data = read.csv("train.csv")  # Dates between 1/1/2012 and 3/31/2013, provides date, store ID, item ID, and number of units sold on that given day (4,617,600 observations, 4 variables)
+test_data = read.csv("test.csv")    # Dates after 4/1/2013 to 10/16/2014 (526,917 observations, 3 variables)
+key = read.csv("key.csv")           # Matches a store ID number with a weather station ID (45 observations, 2 variables)
+
+```
+
+```{r Library Initilization, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+#install.packages("doBy")
+#install.packages("psych")
+#install.packages("FNN")
+library(psych)
+library(doBy)
+library(car)
+library(FNN)
+```
+
+```{r Data Initilization, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+#Here we are going to make a vector of the station_nbr's that corresponds to the store_nbr in the training data set so we need a vector of length 4,617,600 rows.
+station_nbr = numeric(nrow(train_data))
+
+
+#Here we are going through each observation and attch the correct corresponding station_nbr using the key.csv
+for (i in 1:nrow(train_data) ){
+  station_nbr[i] = key$station_nbr[which(train_data$store_nbr[i] == key$store_nbr)]
+}
+
+# Combining the station_nbr with the training data.
+train_data_withstation = cbind(train_data,station_nbr)
+
+
+# Now we merge all the weather data with the training data using merge and the option 'by' which will match each observation with the correct weather data using the date and station_nbr.
+full_training_data = merge(train_data_withstation,weather, by = c("date","station_nbr"))
+
+# Now unforutanely the above merge fucntion doesnt really care about the nice ordered strucutre of the data so it scrables the stores order so in order to fix this just for easier viewing we will
+#   reorder the date store_nbr and item_nbr
+full_training_data = full_training_data[order(full_training_data$date,full_training_data$store_nbr,full_training_data$item_nbr),]
+row.names(full_training_data) <- 1:nrow(full_training_data) ###### CHECK
+
+# To confirm that we havent accidently messed up any of the data we'll check that each of these columns below have the same values by taking the sum which should be 4617600 which is what we get
+sum((full_training_data$store_nbr == train_data$store_nbr) & (full_training_data$item_nbr == train_data$item_nbr) & (full_training_data$date == train_data$date) )
+
+```
+
+```{r Data Prepping (Removing zeros), echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+# First we are gonna use the psych library to get a description of the units using the item_nbr and store_nbr varialbes so we can see which combinations have 0 unit sales
+#   Which would indicate a product that is not sold at a particular store so we can ignore it
+desc = describe.by(full_training_data$units, list(full_training_data$item_nbr,full_training_data$store_nbr),mat=TRUE)
+
+# Two data_frames that contain the stores/items to remove and the stores/items to save
+toremove = desc[which(desc$mean==0),]
+toremove
+tokeep = desc[which(desc$mean!=0),]
+tokeep
+
+# Copy of the full data to manipulate
+full_training_data_nozeros = full_training_data
+
+# Painfully long for loop that goes in and removes each entry that belongs to a item/store comboniation that ultimately had 0 unit sales since which we'll just predict them to have 0 sales
+for ( i in 1:nrow(toremove) ){
+  full_training_data_nozeros = full_training_data_nozeros[-which((toremove$group1[i] == full_training_data_nozeros$item_nbr) & (toremove$group2[i] == full_training_data_nozeros$store_nbr)),]
+  #if ( i %% 10 == 0 ){ print(i)} # Allows me to keep track of the progress to ensure the loop hasnt frozen
+}
+
+# Create a copy of the full data with nozeros so we dont have to rerun the above for loop
+train_data_copy = full_training_data_nozeros
+
+# Renumber the rows
+row.names(train_data_copy) <- 1:nrow(train_data_copy)
+
+# Use a new decription fucntion cause there were errors with the desribe.By one just to confirm that all the remaining stores/item combinations have non-zero unit means
+desc_zeros = summaryBy(units ~ store_nbr + item_nbr, data = train_data_copy,
+  FUN = function(x) { c(m = mean(x), s = sd(x)) } )
+
+
+
+
+```
+
+```{r Cleaning, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+options(digits=6) # Setting the number of significant digits since as.numeric will drop decimals without it
+
+train_data_copy = full_training_data_nozeros # Copy in the data
+train_data_copy$date = as.numeric(train_data_copy$date) - 456 # Set date as numerics with respect to 3/31/2013 (456 days from 1/1/2012) since this is the day before the test dates begin to occur
+
+train_data_copy = train_data_copy[,-c(9:15)] # Delete Depart, Dewpoint, wetbulb, heat, cool, sunrise, sunset as 
+
+summary(train_data_copy)
+# We see that lots of the data contains factors and missing values such as M for Missing or T for Trace. To make our lives easier we will remove these entries although Trace could just be set to zero
+#  We will also convert all but codesum from factors to numerical values as they shoud be.
+
+# Removing observations with "M" from tavg,tmin,tmax and setting as numeric
+train_data_copy = subset(train_data_copy, tmax != "M" | tmin != "M" | tavg != "M" )
+train_data_copy$tavg = as.numeric(train_data_copy$tavg)
+train_data_copy$tmin = as.numeric(train_data_copy$tmin)
+train_data_copy$tmax = as.numeric(train_data_copy$tmax)
+
+# Removing observations with "M" and "T" from snowfall, preciptotal and setting as numeric
+train_data_copy$snowfall = as.character(train_data_copy$snowfall)
+train_data_copy$preciptotal = as.character(train_data_copy$preciptotal)
+train_data_copy = subset(train_data_copy, snowfall != "M")
+train_data_copy = subset(train_data_copy, snowfall != "T")
+train_data_copy = subset(train_data_copy, preciptotal != "M")
+train_data_copy = subset(train_data_copy, preciptotal != "T")
+train_data_copy$snowfall = as.numeric(as.character(train_data_copy$snowfall))
+train_data_copy$preciptotal = as.numeric(as.character(train_data_copy$preciptotal))
+
+# Removing observations with "M" from stnpressure,sealevel,resultspeed,resultdir,avgspeed and setting as numeric
+train_data_copy$stnpressure = as.character(train_data_copy$stnpressure)
+train_data_copy$sealevel = as.character(train_data_copy$sealevel)
+train_data_copy$resultspeed = as.character(train_data_copy$resultspeed)
+train_data_copy$resultdir = as.character(train_data_copy$resultdir)
+train_data_copy$avgspeed = as.character(train_data_copy$avgspeed)
+train_data_copy = subset(train_data_copy, stnpressure != "M")
+train_data_copy = subset(train_data_copy, sealevel != "M")
+train_data_copy = subset(train_data_copy, resultspeed != "M")
+train_data_copy = subset(train_data_copy, resultdir != "M")
+train_data_copy = subset(train_data_copy, avgspeed != "M")
+train_data_copy$stnpressure = as.numeric(as.character(train_data_copy$stnpressure))
+train_data_copy$sealevel = as.numeric(as.character(train_data_copy$sealevel))
+train_data_copy$resultspeed = as.numeric(as.character(train_data_copy$resultspeed))
+train_data_copy$resultdir = as.numeric(as.character(train_data_copy$resultdir))
+train_data_copy$avgspeed = as.numeric(as.character(train_data_copy$avgspeed))
+train_data_copy = na.omit(train_data_copy)
+
+summary(train_data_copy) # And as we can see all variables beside codesum are now numerical values
+
+
+
+```
+
+
+```{r Diagnostics and Data Discovery, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE, fig.width = 13, fig.height = 13}
+
+##### PAIRWISE PLOTS #####
+# Given the amount of points taking a small subset allows us to plot some data and discern any chararteristics of the data
+sampling = sample(1:nrow(train_data_copy), round(nrow(train_data_copy)/50))
+train_data_copy_plotsamples = train_data_copy[sampling,]
+
+pairs(~.,data=train_data_copy_plotsamples) # Pairwise plots of each of the remaining variables
+##########################
+
+
+
+##### Correlation? #####
+cor.tmax.tmin = cor(train_data_copy$tmin,train_data_copy$tmax)
+cor.tmax.tavg = cor(train_data_copy$tmax,train_data_copy$tavg)
+cor.tmin.tavg = cor(train_data_copy$tmin,train_data_copy$tavg)
+cor.sealevel.stnpressure = cor(train_data_copy$sealevel,train_data_copy$stnpressure)
+cor.resultspeed.resultdir = cor(train_data_copy$resultspeed,train_data_copy$resultdir)
+cor.resultspeed.avgspeed = cor(train_data_copy$resultspeed,train_data_copy$avgspeed)
+########################
+
+```
+
+```{r Baseline Linear Model, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10}
+
+data_set_ols = train_data_copy[,-c(6:7,9,14:15)]
+
+# The model we will be using as our baseline linear model will include the variables date, station_nbr, store_nbr, item_nbr, units (Response), tavg, snowfall, preciptotal, stnpressure, sealevel, and avgspeed
+#       The reason for choosing these is stated in the paper
+
+##### Model #####  --- Kaggle score: Private = 0.42542, Public = 0.42385
+selected_model = lm(units ~ ., data = data_set_ols )
+summary(selected_model)
+#################
+
+##### Diagnostics Model #####
+par(mfrow=c(2,2))
+plot(selected_model)
+vif(selected_model)
+#############################
+
+##### Improved Model ##### --- Kaggle score: Private = 0.35388, Public = 0.35238
+selected_model_improved = lm(log(units+1) ~ ., data = data_set_ols )
+summary(selected_model_improved)
+##########################
+
+##### Diagnostics Improved Model #####
+par(mfrow=c(2,2))
+plot(selected_model_improved)
+vif(selected_model_improved)
+######################################
+
+```
+
+```{r Prediction - Using Baseline Linear Model, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10}
+  
+prediction = test_data # Our predictions will be built off of the test data set since it contains all the dates and item/store combos we need to predict
+id = numeric(nrow(prediction)) # The Kaggle submission requires a id
+
+# The for loop below will be used to create a new column in prediction with all the id's by assigning the ids to a vector to be combined later
+for (i in 1:nrow(prediction)){
+  id[i] = paste0(prediction[i,2],"_",prediction[i,3],"_",prediction[i,1])
+}
+
+prediction = cbind(prediction,id) # And its later, here we combine the vector and prediction 
+units = numeric(nrow(prediction)) # Now we are going to do the same thing as above but for the units we will be predicting (These are just place holders)
+
+for (i in 1:nrow(prediction)){
+  units[i] = 0
+}
+
+prediction = cbind(prediction,units) # Again combine them
+
+# Since we have no weather data for any of these dates we need to predict we will use the means
+average_tavg = rep(mean(data_set_ols$tavg))
+average_snowfall = rep(mean(data_set_ols$snowfall))
+average_preciptotal = rep(mean(data_set_ols$preciptotal))
+average_stnpressure = rep(mean(data_set_ols$stnpressure))
+average_sealevel = rep(mean(data_set_ols$sealevel))
+average_avgspeed = rep(mean(data_set_ols$avgspeed))
+
+# We do know the dates, stores, items, and stations we will be predicting for
+dates = as.numeric(prediction$date)
+stores = prediction$store_nbr
+items = prediction$item_nbr
+
+station = numeric(nrow(prediction))
+for (t in 1:nrow(prediction)){
+  station[t] =  key[which(key$store_nbr == stores[t]),2]
+}
+
+# Simple prediction data frame to be used in the predict function
+pred_data = data.frame(date = dates, store_nbr = stores, item_nbr = items, station_nbr = station , tavg = average_tavg, snowfall = average_snowfall, preciptotal = average_preciptotal
+                       , stnpressure = average_stnpressure , sealevel = average_sealevel, avgspeed = average_avgspeed)
+
+predict_fit = predict(selected_model, pred_data, interval = "prediction", level = 0.95)  # Predict values
+prediction$units = round(predict_fit[,1])
+
+# This for loop will go through every value in prediction for units and if there is a negative value it will turn it into 0 since we arent going to predict negative unit sales
+for(i in 1:nrow(prediction)){
+  #if (i %% 1000 == 0){print(i)} # Used to monitor progress
+  if(prediction$units[i] < 0 )
+    { 
+    prediction$units[i] = 0
+    next}
+}
+
+# This for loop is going to go through all the store and item combinations that lead to 0 mean unit sales and reset them to 0 since our regression prediction is continous and changed their values
+#   so we are gonna change them back to 0.
+for(k in 1:nrow(toremove)){
+    # if( k %% 10 == 0){print(k)} # Used to monitor progress 
+    prediction$units[which(prediction$store_nbr == toremove$group2[k] & prediction$item_nbr == toremove$group1[k])] = 0
+}
+
+submit = prediction[,-c(1:3)]  #We are going to delete the first 3 columns since they arent suppose to be in the submisson file
+write.csv(submit,"submit_preliminary_linear_final.csv", row.names = FALSE)
+```
+
+
+
+```{r Prediction - Using Log transformed model, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 10}
+  
+prediction = test_data # Our predictions will be built off of the test data set since it contains all the dates and item/store combos we need to predict
+id = numeric(nrow(prediction)) # The Kaggle submission requires a id
+
+# The for loop below will be used to create a new column in prediction with all the id's by assigning the ids to a vector to be combined later
+for (i in 1:nrow(prediction)){
+  id[i] = paste0(prediction[i,2],"_",prediction[i,3],"_",prediction[i,1])
+}
+
+prediction = cbind(prediction,id) # And its later, here we combine the vector and prediction 
+units = numeric(nrow(prediction)) # Now we are going to do the same thing as above but for the units we will be predicting (These are just place holders)
+
+for (i in 1:nrow(prediction)){
+  units[i] = 0
+}
+
+prediction = cbind(prediction,units) # Again combine them
+
+# Since we have no weather data for any of these dates we need to predict we will use the means
+average_tavg = rep(mean(data_set_ols$tavg))
+average_snowfall = rep(mean(data_set_ols$snowfall))
+average_preciptotal = rep(mean(data_set_ols$preciptotal))
+average_stnpressure = rep(mean(data_set_ols$stnpressure))
+average_sealevel = rep(mean(data_set_ols$sealevel))
+average_avgspeed = rep(mean(data_set_ols$avgspeed))
+
+# We do know the dates, stores, items, and stations we will be predicting for
+dates = as.numeric(prediction$date)
+stores = prediction$store_nbr
+items = prediction$item_nbr
+
+station = numeric(nrow(prediction))
+for (t in 1:nrow(prediction)){
+  station[t] =  key[which(key$store_nbr == stores[t]),2]
+}
+
+# Simple prediction data frame to be used in the predict function
+pred_data = data.frame(date = dates, store_nbr = stores, item_nbr = items, station_nbr = station , tavg = average_tavg, snowfall = average_snowfall, preciptotal = average_preciptotal
+                       , stnpressure = average_stnpressure , sealevel = average_sealevel, avgspeed = average_avgspeed)
+
+predict_fit = predict(selected_model_improved, pred_data, interval = "prediction", level = 0.95)  # Predict values
+prediction$units = round(exp(predict_fit[,1])+1) # Undo the log
+
+# This for loop will go through every value in prediction for units and if there is a negative value it will turn it into 0 since we arent going to predict negative unit sales
+for(i in 1:nrow(prediction)){
+  #if (i %% 1000 == 0){print(i)} # Used to monitor progress
+  if(prediction$units[i] < 0 )
+    { 
+    prediction$units[i] = 0
+    next}
+}
+
+# This for loop is going to go through all the store and item combinations that lead to 0 mean unit sales and reset them to 0 since our regression prediction is continous and changed their values
+#   so we are gonna change them back to 0.
+for(k in 1:nrow(toremove)){
+    # if( k %% 10 == 0){print(k)} # Used to monitor progress 
+    prediction$units[which(prediction$store_nbr == toremove$group2[k] & prediction$item_nbr == toremove$group1[k])] = 0
+}
+
+submit = prediction[,-c(1:3)]  #We are going to delete the first 3 columns since they arent suppose to be in the submisson file
+write.csv(submit,"submit_loglinear_final.csv", row.names = FALSE)
+```
+
+```{r Improvements - Variable Selection, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+log_linear_backward_selection_AIC = step(selected_model_improved)
+
+null_model = lm(log(units + 1) ~ 1, data=data_set_ols )
+log_linear_forward_selection_AIC = step(null_model, direction = c("forward"), scope = list(upper = selected_model_improved, lower = null_model))
+
+```
+
+```{r Prediction - KNN model, echo=TRUE , eval=TRUE, warning = FALSE, message = FALSE}
+
+##### Same prediction setup as above #####
+prediction = test_data
+id = numeric(nrow(prediction))
+
+for (i in 1:nrow(prediction)){
+  id[i] = paste0(prediction[i,2],"_",prediction[i,3],"_",prediction[i,1])
+}
+
+prediction = cbind(prediction,id)
+
+
+units = numeric(nrow(prediction))
+for (i in 1:nrow(prediction)){
+  units[i] = 0
+}
+
+prediction = cbind(prediction,units)
+##########################################
+
+
+
+##### K Nearest Neighbor #####   --- Kaggle score: Private = 0.10605, Public = 0.10734
+train_data_copy = full_training_data_nozeros # Make a copy of the full_training data set with the zero means removed so we dont have to rerun the cancer loop
+train_data_copy$date = as.numeric(train_data_copy$date) - 456 # Again set the dates in relation too 3/31/2013
+
+knn_storeitem_combo = test_data # Create a copy of test data so as not to mess with it
+knn_storeitem_combo$date = as.numeric(knn_storeitem_combo$date) # Set dates as numerics (These are the dates we want to predict)
+
+# The loop below will cycle through all the entries in the tokeep list (Which is all the store and item combos that had non-zero unit means) and run the knn algorithm and compute the predicted number of units
+#   sold for the dates within the test/prediction data set and will assign the predicted values (Without chaning the predicted zeros from the zero-mean combinations)
+for ( i in 1:nrow(tokeep)){
+  
+  # We'll create a subset of the test data which are in the tokeep data set which contains the store and item combos that had non-zero unit means
+  knn_store_item = subset(train_data_copy, train_data_copy$store_nbr == tokeep$group2[i] & train_data_copy$item_nbr == tokeep$group1[i])
+  
+  # Remove all the unused data, we only need date and units
+  knn_store_item = knn_store_item[,-c(2:4,6:23)]
+  knn_store_item_train = knn_store_item
+  knn_store_item_test = subset(knn_storeitem_combo, knn_storeitem_combo$store_nbr == tokeep$group2[i] & knn_storeitem_combo$item_nbr == tokeep$group1[i])
+  
+  if (nrow(knn_store_item_test) == 0){next}
+
+  # As we did in the improved linear model, we will preform a log transformation to the response variables since it fixes unwanted behavior (Running knn without transformation produces very poor model)
+  knn_store_item_train$units = (log(1 + knn_store_item_train$units))
+
+  # Actual KNN regression function from FNN library
+  predict_knn_store_item = knn.reg( train = as.data.frame(knn_store_item_train[,1]), test = as.data.frame(knn_store_item_test[,1]), y = knn_store_item_train[,2] , k=30)
+  
+  # Set the predicted values to units
+  units = predict_knn_store_item$pred
+  knn_store_item_test$units = units
+  knn_store_item_test$units = round(exp(knn_store_item_test$units)-1) # Undo log transformation
+  
+  # Set the predictions into prediction
+  prediction$units[which(prediction$store_nbr == tokeep$group2[i] & prediction$item_nbr == tokeep$group1[i])] = knn_store_item_test$units
+
+}
+
+submit = prediction[,-c(1:3)]
+write.csv(submit,"submit_KNN_k30_FINAL.csv", row.names = FALSE) 
+#################################
+
+```
